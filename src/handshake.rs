@@ -7,7 +7,7 @@ use std::{
 };
 
 pub(crate) fn handshake(tcp_stream: &mut TcpStream) -> Result<()> {
-    let request = receive_http_request(&tcp_stream)?;
+    let request = receive_http_request(tcp_stream)?;
 
     println!("{:#?}", request);
 
@@ -45,14 +45,6 @@ fn send_websocket_upgrade_response(
 
     let aceept_key = generate_accept_key(key);
 
-    let extension = request.headers.iter().find_map(|(key, value)| {
-        if key == "Sec-WebSocket-Extensions" {
-            Some(value)
-        } else {
-            None
-        }
-    });
-
     let mut response = String::new();
 
     response.push_str("HTTP/1.1 101 Switching Protocols\r\n");
@@ -80,9 +72,9 @@ fn generate_accept_key(client_key: &str) -> String {
 
 #[derive(Debug)]
 struct HttpRequest {
-    method: String,
-    path: String,
-    protocol: String,
+    _method: String,
+    _path: String,
+    _protocol: String,
     headers: Vec<(String, String)>,
 }
 
@@ -114,9 +106,9 @@ fn receive_http_request(tcp_stream: &TcpStream) -> Result<HttpRequest> {
     }
 
     Ok(HttpRequest {
-        method: method.to_string(),
-        path: path.to_string(),
-        protocol: protocol.to_string(),
+        _method: method.to_string(),
+        _path: path.to_string(),
+        _protocol: protocol.to_string(),
         headers,
     })
 }

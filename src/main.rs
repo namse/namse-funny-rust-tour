@@ -136,13 +136,11 @@ fn receive_text_message(tcp_stream: &mut TcpStream) -> Result<String> {
 
         tcp_stream.read_exact(&mut extended_payload_header)?;
 
-        let extended_payload_length = match extended_payload_header_byte_length {
+        match extended_payload_header_byte_length {
             2 => u16::from_be_bytes(extended_payload_header.try_into().unwrap()) as u64,
             8 => u64::from_be_bytes(extended_payload_header.try_into().unwrap()),
             _ => unreachable!(),
-        };
-
-        extended_payload_length
+        }
     };
 
     let mut masking_key = [0u8; 4];
