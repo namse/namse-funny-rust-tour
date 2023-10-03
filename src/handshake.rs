@@ -9,8 +9,6 @@ use std::{
 pub(crate) fn handshake(tcp_stream: &mut TcpStream) -> Result<()> {
     let request = receive_http_request(tcp_stream)?;
 
-    println!("{:#?}", request);
-
     if !request
         .headers
         .iter()
@@ -53,7 +51,6 @@ fn send_websocket_upgrade_response(
     response.push_str("Upgrade: websocket\r\n");
     response.push_str("\r\n");
 
-    println!("response: {}", response);
     tcp_stream.write_all(response.as_bytes())?;
 
     Ok(())
