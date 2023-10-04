@@ -1,10 +1,16 @@
+mod db;
 mod handshake;
 
 use anyhow::Result;
-use std::{
-    io::{Read, Write},
-    net::TcpStream,
-    time::Duration,
+use db::{init_db, Db};
+use handshake::{receive_http_request, send_websocket_upgrade_response, HttpRequest};
+use std::sync::Arc;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
 };
 
 /*
@@ -15,24 +21,27 @@ low level로 웹소켓을 구현하고, 그것으로 채팅을 구현하는 것.
 = 라이브러리 안쓰겠다.
 */
 
-fn main() -> Result<()> {
-    let tcp_listener = std::net::TcpListener::bind("0.0.0.0:8080")?;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let db = Arc::new(init_db().await?);
 
-    let user_txs = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+
+    let user_txs = std::sync::Arc::new(tokio::sync::Mutex::new(vec![]));
     // Arc 쓰는 이유: 언제 힙에서 제거해야하는지 알기 위해서!
 
     loop {
-        let (tcp_stream, _) = tcp_listener.accept()?;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tcp_stream, _) = tcp_listener.accept().await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let id = generate_new_id();
 
         {
-            let mut user_txs = user_txs.lock().unwrap();
+            let mut user_txs = user_txs.lock().await;
             user_txs.push(UserTx { id, tx });
         }
         // Q. 코파일럿이 굳이 이거를 Block{}을 만들어서 위 코드를 짠 이유는?
 
-        run_user_thread(tcp_stream, rx, id, user_txs.clone());
+        start_user_loop(tcp_stream, rx, id, user_txs.clone(), db.clone());
     }
 
     // Q. 유저 5천명 들어오면, 스레드 몇개? 5천개
@@ -40,10 +49,10 @@ fn main() -> Result<()> {
 
 struct UserTx {
     id: u64,
-    tx: std::sync::mpsc::Sender<String>,
+    tx: tokio::sync::mpsc::Sender<String>,
 }
 
-type UserTxs = std::sync::Arc<std::sync::Mutex<Vec<UserTx>>>;
+type UserTxs = std::sync::Arc<tokio::sync::Mutex<Vec<UserTx>>>;
 
 /*
     연결을 받으면
@@ -62,66 +71,190 @@ type UserTxs = std::sync::Arc<std::sync::Mutex<Vec<UserTx>>>;
 
     스레드는 언제까지 돌아야해? 언제 꺼져야해?
 */
-fn run_user_thread(
-    mut tcp_stream: TcpStream,
-    rx: std::sync::mpsc::Receiver<String>,
+fn start_user_loop(
+    tcp_stream: TcpStream,
+    rx: tokio::sync::mpsc::Receiver<String>,
     my_id: u64,
     user_txs: UserTxs,
+    db: Arc<Db>,
 ) {
-    std::thread::spawn(move || -> Result<()> {
-        tcp_stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    tokio::spawn(async move {
+        let _ = user_loop(tcp_stream, rx, my_id, user_txs.clone(), db).await;
 
-        if let Err(error) = handshake::handshake(&mut tcp_stream) {
-            println!("Handshake Error: {:?}", error);
-            anyhow::bail!("Handshake Error: {:?}", error);
-        }
-
-        let mut partial_websocket_message = PartialWebsocketMessage {
-            core_payload_length: None,
-            extended_payload_length: None,
-            masking_key: None,
-            payload: None,
-        };
-        loop {
-            match receive_user_message_and_send_to_other_users(
-                &mut tcp_stream,
-                &mut partial_websocket_message,
-                my_id,
-                &user_txs,
-            ) {
-                Ok(_) => {
-                    partial_websocket_message.clean_up();
-                }
-                Err(error) => match error {
-                    ReceiveUserMessageError::Io(error) => {
-                        match error.kind() {
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                                // 아무것도 안함.
-                            }
-                            _ => {
-                                todo!("에러처리 해야함 {:?}", error.kind())
-                            }
-                        }
-                    }
-                    ReceiveUserMessageError::NonSupported(error) => {
-                        todo!("에러처리 해야함 {:?}", error)
-                    }
-                },
-            }
-
-            match send_other_users_messages_to_user(&mut tcp_stream, &rx) {
-                Ok(_) => {}
-                Err(error) => {
-                    todo!("에러처리 해야함 {:?}", error)
-                }
-            };
-        }
+        user_txs.lock().await.retain(|user_tx| user_tx.id != my_id);
     });
 }
 
-fn send_other_users_messages_to_user(
+async fn user_loop(
+    mut tcp_stream: TcpStream,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    my_id: u64,
+    user_txs: UserTxs,
+    db: Arc<Db>,
+) -> Result<()> {
+    let request = receive_http_request(&mut tcp_stream).await?;
+
+    if !request.is_websocket_upgrade_request() {
+        handle_non_websocket_http_request(&mut tcp_stream, request, &db).await?;
+        return Ok(());
+    }
+
+    send_websocket_upgrade_response(&mut tcp_stream, &request).await?;
+
+    let mut partial_websocket_message = PartialWebsocketMessage {
+        core_payload_length: None,
+        extended_payload_length: None,
+        masking_key: None,
+        payload: None,
+    };
+
+    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+    let recv_task = tokio::spawn({
+        let close_notify = close_notify.clone();
+        async move {
+            loop {
+                match receive_user_message_and_send_to_other_users(
+                    &mut tcp_read,
+                    &mut partial_websocket_message,
+                    my_id,
+                    &user_txs,
+                    &db,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        println!("user {my_id} send Message");
+                        partial_websocket_message.clean_up();
+                    }
+                    Err(error) => match error {
+                        ReceiveUserMessageError::Io(error) => {
+                            todo!("에러처리 해야함 {:?}", error.kind())
+                        }
+                        ReceiveUserMessageError::NonSupported(error) => {
+                            todo!("에러처리 해야함 {:?}", error)
+                        }
+                        ReceiveUserMessageError::Disconnected => {
+                            close_notify.notify_one();
+                            user_txs.lock().await.retain(|user_tx| user_tx.id != my_id);
+                            break;
+                        }
+                        ReceiveUserMessageError::FailToSaveMessageToDb => {
+                            println!("Fail to save message to db");
+                            continue;
+                        }
+                    },
+                }
+            }
+        }
+    });
+
+    let send_task = tokio::spawn(async move {
+        match send_other_users_messages_to_user(&mut tcp_write, &mut rx, my_id, close_notify).await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                todo!("에러처리 해야함 {:?}", error)
+            }
+        };
+    });
+
+    recv_task.await.unwrap();
+    send_task.await.unwrap();
+
+    Ok(())
+}
+
+async fn handle_non_websocket_http_request(
     tcp_stream: &mut TcpStream,
-    rx: &std::sync::mpsc::Receiver<String>,
+    request: HttpRequest,
+    db: &Db,
+) -> Result<()> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/") => {
+            let mut messages = db.list_messages(10).await?;
+            messages.reverse();
+
+            let message_lis = messages
+                .into_iter()
+                .map(|message| format!("<li>{}</li>", message))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            /*
+                생길 수 있는 버그
+                1. DB에서 메시지를 긁어다가 사용자에게 보내줄 것.
+                2. 근데 그 사이에 다른 유저가 메시지를 보냄.
+                3. 하지만 이 사용자는 WebSocket을 연결하기 전인걸?
+                4. 그러면 이 사용자는 html을 받고, WebSocket을 연결하기 전에 생긴 새로운 메시지들은 못받겠네?
+            */
+
+            let index_html = format!(
+                "
+            <html>
+                <head>
+                    <title>Chat</title>
+                    <meta charset=\"utf-8\">
+                </head>
+                <body>
+                    <input id=\"input\" type=\"text\"/>
+                    <ul id=\"messages\">
+                        {message_lis}
+                    </ul>
+
+                    <script>
+                        const input = document.getElementById('input');
+                        const messages = document.getElementById('messages');
+                        const ws = new WebSocket(`ws://${{location.host}}/`);
+
+                        // TODO: 내가 가지고 있는 가장 최근 메시지 이후로 또 온게 있으면 보내줘. 혹시 모르니까!
+
+                        ws.addEventListener('message', (event) => {{
+                            const message = event.data;
+                            addMessageToList(message);
+                        }});
+
+                        input.addEventListener('keydown', (event) => {{
+                            if (event.key === 'Enter') {{
+                                const message = input.value;
+                                input.value = '';
+
+                                ws.send(message);
+                                addMessageToList(message);
+                            }}
+                        }});
+
+                        function addMessageToList(message) {{
+                            const li = document.createElement('li');
+                            li.innerText = message;
+                            messages.appendChild(li);
+                        }}
+                    </script>
+                </body>
+            </html>
+            "
+            );
+
+            tcp_stream
+                .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{}", index_html).as_bytes())
+                .await?;
+        }
+        _ => {
+            tcp_stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\n\r\n")
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_other_users_messages_to_user(
+    tcp_write: &mut OwnedWriteHalf,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    my_id: u64,
+    close_notify: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     // mpsc = multiple producer, single consumer queue
 
@@ -132,14 +265,25 @@ fn send_other_users_messages_to_user(
     Q. 다른 유저들이 보낸 메시지를 내가 어떻게 받아?
     */
 
-    // TODO: Non-blocking
-    loop {
-        let Ok(other_user_message) = rx.recv_timeout(Duration::from_secs(1)) else {
-            return Ok(());
-        };
+    // 클로즈 되었거나, 새 메시지를 받거나!
 
-        write_text_message(tcp_stream, &other_user_message)?;
+    loop {
+        tokio::select! {
+            _ = close_notify.notified() => {
+                println!("user {my_id}: Connection Closed");
+                rx.close();
+                while let Some(message) = rx.recv().await {
+                    write_text_message(tcp_write, &message).await?;
+                }
+                break;
+            }
+            Some(message) = rx.recv() => {
+                write_text_message(tcp_write, &message).await?;
+            }
+        }
     }
+
+    Ok(())
 }
 
 // 0                   1                   2                   3
@@ -179,13 +323,16 @@ impl PartialWebsocketMessage {
 enum ReceiveUserMessageError {
     Io(std::io::Error),
     NonSupported(String),
+    Disconnected,
+    FailToSaveMessageToDb,
 }
 
-fn receive_user_message_and_send_to_other_users(
-    tcp_stream: &mut TcpStream,
+async fn receive_user_message_and_send_to_other_users(
+    tcp_read: &mut OwnedReadHalf,
     partial_message: &mut PartialWebsocketMessage,
     my_id: u64,
     user_txs: &UserTxs,
+    db: &Db,
 ) -> Result<(), ReceiveUserMessageError> {
     /*
     Timeout동안 메시지를 유저로부터 기다려보고
@@ -197,26 +344,31 @@ fn receive_user_message_and_send_to_other_users(
 
     if partial_message.core_payload_length.is_none() {
         let mut core_header = [0u8; 2];
-        tcp_stream
+        tcp_read
             .read_exact(&mut core_header)
+            .await
             .map_err(ReceiveUserMessageError::Io)?;
 
         let fin = core_header[0] & 0b1000_0000 != 0;
         let opcode = core_header[0] & 0b0000_1111;
         let mask = core_header[1] & 0b1000_0000 != 0;
 
-        println!("core_header: {:?}", core_header);
-        println!("fin: {}, opcode: {}, mask: {}", fin, opcode, mask);
-
         if !fin {
             return Err(ReceiveUserMessageError::NonSupported(
                 "Fragmented messages are not supported".to_string(),
             ));
         }
-        if opcode != 0b0001 {
-            return Err(ReceiveUserMessageError::NonSupported(
-                "Only text messages are supported".to_string(),
-            ));
+        match opcode {
+            1 => {}
+            8 => {
+                return Err(ReceiveUserMessageError::Disconnected);
+            }
+            _ => {
+                return Err(ReceiveUserMessageError::NonSupported(format!(
+                    "Not supported opcode: {}",
+                    opcode
+                )));
+            }
         }
         if !mask {
             return Err(ReceiveUserMessageError::NonSupported(
@@ -246,8 +398,9 @@ fn receive_user_message_and_send_to_other_users(
 
         let mut extended_payload_header = vec![0u8; extended_payload_header_byte_length];
 
-        tcp_stream
+        tcp_read
             .read_exact(&mut extended_payload_header)
+            .await
             .map_err(ReceiveUserMessageError::Io)?;
 
         let total_payload_length = match extended_payload_header_byte_length {
@@ -262,8 +415,9 @@ fn receive_user_message_and_send_to_other_users(
 
     if partial_message.masking_key.is_none() {
         let mut masking_key = [0u8; 4];
-        tcp_stream
+        tcp_read
             .read_exact(&mut masking_key)
+            .await
             .map_err(ReceiveUserMessageError::Io)?;
 
         partial_message.masking_key = Some(masking_key);
@@ -274,8 +428,9 @@ fn receive_user_message_and_send_to_other_users(
     if partial_message.payload.is_none() {
         let mut payload = vec![0u8; total_payload_length as usize];
 
-        tcp_stream
-            .read_exact(&mut payload) // 여기 좀 문제가 될듯?
+        tcp_read
+            .read_exact(&mut payload)
+            .await // 여기 좀 문제가 될듯?
             .map_err(ReceiveUserMessageError::Io)?;
 
         for (i, byte) in payload.iter_mut().enumerate() {
@@ -288,7 +443,10 @@ fn receive_user_message_and_send_to_other_users(
     let payload = partial_message.payload.take().unwrap();
     let text = String::from_utf8(payload).unwrap();
 
-    send_to_other_users(text, my_id, user_txs);
+    db.add_message(&text)
+        .await
+        .map_err(|_| ReceiveUserMessageError::FailToSaveMessageToDb)?;
+    send_to_other_users(text, my_id, user_txs).await;
 
     Ok(())
 
@@ -299,20 +457,20 @@ fn receive_user_message_and_send_to_other_users(
     // A. 사라집니다. 왜냐하면 함수의 스택 프레임이 사라지면서, 그 안에 있던 변수들도 사라지기 때문입니다.
 }
 
-fn send_to_other_users(text: String, my_id: u64, user_txs: &UserTxs) {
+async fn send_to_other_users(text: String, my_id: u64, user_txs: &UserTxs) {
     // RAII: Resource Acquisition Is Initialization
-    let user_txs = user_txs.lock().unwrap();
+    let user_txs = user_txs.lock().await;
     let other_user_txs = user_txs.iter().filter(|user_tx| user_tx.id != my_id);
 
     // Q. user_txs에는 나를 포함해서 다 있는데, 나를 제외한 txs를 얻으려면 어떻게 해야합니까?
     // A. tx를 구분할 수 있는 그들만의 고유한 값이 있으면 되겠네! 그리고 내가 나의 tx의 고유값을 알고 있으면 되겠네!
 
     for user_tx in other_user_txs {
-        let _ = user_tx.tx.send(text.clone());
+        let _ = user_tx.tx.send(text.clone()).await;
     }
 }
 
-fn write_text_message(tcp_stream: &mut TcpStream, message: &str) -> Result<()> {
+async fn write_text_message(tcp_write: &mut OwnedWriteHalf, message: &str) -> Result<()> {
     let mut core_header = [0u8; 2];
     core_header[0] |= 0b1000_0001;
 
@@ -322,8 +480,8 @@ fn write_text_message(tcp_stream: &mut TcpStream, message: &str) -> Result<()> {
     }
     core_header[1] |= message.len() as u8;
 
-    tcp_stream.write_all(&core_header)?;
-    tcp_stream.write_all(message.as_bytes())?;
+    tcp_write.write_all(&core_header).await?;
+    tcp_write.write_all(message.as_bytes()).await?;
 
     Ok(())
 }

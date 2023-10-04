@@ -1,31 +1,12 @@
 use anyhow::Result;
 use base64::Engine;
 use sha1::Digest;
-use std::{
-    io::{BufRead, BufReader, Write},
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 
-pub(crate) fn handshake(tcp_stream: &mut TcpStream) -> Result<()> {
-    let request = receive_http_request(tcp_stream)?;
-
-    if !request
-        .headers
-        .iter()
-        .any(|(key, value)| key == "Upgrade" && value == "websocket")
-    {
-        println!("Not WebSocket Request");
-        tcp_stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")?;
-        tcp_stream.shutdown(std::net::Shutdown::Both)?;
-        return Err(anyhow::anyhow!("Not WebSocket Request"));
-    }
-
-    send_websocket_upgrade_response(tcp_stream, &request)?;
-
-    Ok(())
-}
-
-fn send_websocket_upgrade_response(
+pub(crate) async fn send_websocket_upgrade_response(
     tcp_stream: &mut TcpStream,
     request: &HttpRequest,
 ) -> Result<()> {
@@ -51,7 +32,7 @@ fn send_websocket_upgrade_response(
     response.push_str("Upgrade: websocket\r\n");
     response.push_str("\r\n");
 
-    tcp_stream.write_all(response.as_bytes())?;
+    tcp_stream.write_all(response.as_bytes()).await?;
 
     Ok(())
 }
@@ -68,18 +49,25 @@ fn generate_accept_key(client_key: &str) -> String {
 }
 
 #[derive(Debug)]
-struct HttpRequest {
-    _method: String,
-    _path: String,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
     _protocol: String,
     headers: Vec<(String, String)>,
 }
+impl HttpRequest {
+    pub(crate) fn is_websocket_upgrade_request(&self) -> bool {
+        self.headers
+            .iter()
+            .any(|(key, value)| key == "Upgrade" && value == "websocket")
+    }
+}
 
-fn receive_http_request(tcp_stream: &TcpStream) -> Result<HttpRequest> {
+pub(crate) async fn receive_http_request(tcp_stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut buf_reader = BufReader::new(tcp_stream);
 
     let mut line = String::new();
-    buf_reader.read_line(&mut line)?;
+    buf_reader.read_line(&mut line).await?;
 
     let mut iter = line.split_whitespace();
 
@@ -91,7 +79,7 @@ fn receive_http_request(tcp_stream: &TcpStream) -> Result<HttpRequest> {
 
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line)?;
+        buf_reader.read_line(&mut line).await?;
 
         if line == "\r\n" {
             break;
@@ -103,8 +91,8 @@ fn receive_http_request(tcp_stream: &TcpStream) -> Result<HttpRequest> {
     }
 
     Ok(HttpRequest {
-        _method: method.to_string(),
-        _path: path.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
         _protocol: protocol.to_string(),
         headers,
     })
